@@ -315,9 +315,9 @@ pub enum FeeScheduleError {
 /// feeds the payout math inside this bound:
 /// - `init` rejects `amount > MAX_INVOICE_AMOUNT` (`AmountExceedsMax`, 14).
 /// - `update_funding_target` rejects `new_target > escrow.amount`
-///   (`TargetExceedsInvoiceAmount`, 250), so `target ≤ amount ≤ MAX_INVOICE_AMOUNT`.
+///   (`TargetExceedsInvoiceAmount`, 267), so `target ≤ amount ≤ MAX_INVOICE_AMOUNT`.
 /// - `fund_impl` rejects `funded_amount > MAX_INVOICE_AMOUNT` after the
-///   `checked_add` (`FundedAmountExceedsSafeEnvelope`, 251), so even
+///   `checked_add` (`FundedAmountExceedsSafeEnvelope`, 268), so even
 ///   over-funding past the target keeps `total_principal ≤ MAX_INVOICE_AMOUNT`.
 pub const MAX_INVOICE_AMOUNT: i128 = (1i128 << 63) - 1; // floor(√(i128::MAX / 2))
 
@@ -7635,23 +7635,41 @@ impl LiquifactEscrow {
         // Extend instance storage TTL once at the beginning (contract-wide TTL).
         env.storage().instance().extend_ttl(ttl, ttl);
 
-        // Extend persistent TTL for per-investor entries once per investor.
+        // Persistent per-investor keys and allowlist entries (independent TTL per address).
+        // Each key is guarded by `has()` before `extend_ttl`: `extend_ttl` on an absent
+        // key raises `Error(Storage, MissingValue)`.  Not every per-investor key is
+        // present for every address — e.g. `InvestorClaimed` only exists after a claim,
+        // and `InvestorRefunded` (issue #1541) only exists after a refund in a cancelled
+        // escrow — so absent keys are silently skipped, matching the `batch_bump_ttl`
+        // contract.  This keeps `bump_ttl` safe to call for investors in any lifecycle
+        // state.
         for addr in allowlisted.iter() {
-            // Extend each persistent key only if it exists.
-            let keys_to_check = [
-                DataKey::InvestorAllowlisted(addr.clone()),
-                DataKey::InvestorContribution(addr.clone()),
-                DataKey::InvestorEffectiveYield(addr.clone()),
-                DataKey::InvestorClaimNotBefore(addr.clone()),
-                DataKey::InvestorClaimed(addr.clone()),
-            ];
-
-            for key in keys_to_check.iter() {
-                if env.storage().persistent().has(key) {
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(key, ttl, ttl);
-                }
+            let k = DataKey::InvestorAllowlisted(addr.clone());
+            if env.storage().persistent().has(&k) {
+                env.storage().persistent().extend_ttl(&k, ttl, ttl);
+            }
+            // Extend persistent TTL for per-investor persistent keys used by this contract.
+            let ck = DataKey::InvestorContribution(addr.clone());
+            if env.storage().persistent().has(&ck) {
+                env.storage().persistent().extend_ttl(&ck, ttl, ttl);
+            }
+            let yk = DataKey::InvestorEffectiveYield(addr.clone());
+            if env.storage().persistent().has(&yk) {
+                env.storage().persistent().extend_ttl(&yk, ttl, ttl);
+            }
+            let nk = DataKey::InvestorClaimNotBefore(addr.clone());
+            if env.storage().persistent().has(&nk) {
+                env.storage().persistent().extend_ttl(&nk, ttl, ttl);
+            }
+            let clk = DataKey::InvestorClaimed(addr.clone());
+            if env.storage().persistent().has(&clk) {
+                env.storage().persistent().extend_ttl(&clk, ttl, ttl);
+            }
+            // Refund flag (issue #1541): also per-investor persistent. Absent for
+            // investors who have not been refunded in a cancelled escrow.
+            let rk = DataKey::InvestorRefunded(addr.clone());
+            if env.storage().persistent().has(&rk) {
+                env.storage().persistent().extend_ttl(&rk, ttl, ttl);
             }
         }
     }
@@ -7753,13 +7771,15 @@ impl LiquifactEscrow {
                 | DataKey::InvestorEffectiveYield(_)
                 | DataKey::InvestorClaimNotBefore(_)
                 | DataKey::InvestorClaimed(_)
-                | DataKey::InvestorAllowlisted(_) => {
+                | DataKey::InvestorAllowlisted(_)
+                | DataKey::InvestorRefunded(_) => {
                     // Only extend TTL for keys that actually exist in persistent storage.
                     // `extend_ttl` on an absent key raises `Error(Storage, MissingValue)`;
                     // callers supply keys they intend to keep alive but some (e.g. a
-                    // newly-allowlisted investor who has not yet funded) may not have all
-                    // five per-investor keys written yet. Skipping absent keys is safe:
-                    // there is nothing to keep alive if the entry does not exist.
+                    // newly-allowlisted investor who has not yet funded, or an investor
+                    // who has not yet been refunded) may not have every per-investor key
+                    // written yet. Skipping absent keys is safe: there is nothing to keep
+                    // alive if the entry does not exist.
                     if env.storage().persistent().has(&key) {
                         env.storage().persistent().extend_ttl(
                             &key,
@@ -8089,13 +8109,10 @@ impl LiquifactEscrow {
 
     /// Transfer principal only to its investor; batch mode skips ineligible entries.
     fn refund_core(env: &Env, investor: Address, skip_ineligible: bool) -> i128 {
-        if skip_ineligible
-            && env
-                .storage()
-                .instance()
-                .get(&DataKey::InvestorRefunded(investor.clone()))
-                .unwrap_or(false)
-        {
+        // Skip already-refunded entries without failing.  The read goes through
+        // `investor_refunded`, which checks persistent storage first and migrates
+        // any legacy instance entry (issue #1541).
+        if skip_ineligible && Self::investor_refunded(env, investor.clone()) {
             return 0;
         }
 
@@ -8116,9 +8133,19 @@ impl LiquifactEscrow {
         // Extend TTL for all per-investor persistent keys written during refund.
         Self::extend_investor_ttl(env, &investor);
 
+        // Store the refund flag in **persistent** storage (ADR-007 / schema v6,
+        // issue #1541) so the instance entry does not grow with every refund.  Each
+        // refunded investor would otherwise add a permanent entry to instance storage
+        // that every subsequent invocation pays to load.
         env.storage()
-            .instance()
-            .set(&DataKey::InvestorRefunded(investor.clone()), &true);
+            .persistent()
+            .set(&keys::investor_refunded(investor.clone()), &true);
+        let refund_ttl = Self::get_storage_limit(env.clone());
+        env.storage().persistent().extend_ttl(
+            &keys::investor_refunded(investor.clone()),
+            refund_ttl,
+            refund_ttl,
+        );
 
         // Track distributed principal so sweep_terminal_dust can enforce the liability floor.
         let prev_distributed: i128 = env
@@ -8338,12 +8365,69 @@ impl LiquifactEscrow {
         escrow
     }
 
-    /// Whether an investor has already received a refund in a cancelled escrow.
-    pub fn is_investor_refunded(env: Env, investor: Address) -> bool {
-        env.storage()
+    /// Private read helper for the per-investor refund flag.
+    ///
+    /// Checks **persistent** storage first (the schema v6 location, issue #1541) and
+    /// falls back to the legacy **instance** entry written by pre-#1541 WASM.  When a
+    /// legacy instance entry is found on a refund-path read, it is migrated in place:
+    /// the persistent entry is written (with its TTL extended via `get_storage_limit`)
+    /// and the instance entry is removed, so subsequent reads hit persistent storage
+    /// directly and the instance map stops growing with every refund.
+    ///
+    /// Migration is atomic within a single host call: Soroban commits all storage writes
+    /// together or rolls them all back on trap, so there is no window in which both the
+    /// persistent and instance locations are simultaneously absent.
+    fn investor_refunded(env: &Env, investor: Address) -> bool {
+        // Schema v6 location: persistent storage.
+        let persistent_val = env
+            .storage()
+            .persistent()
+            .get(&keys::investor_refunded(investor.clone()))
+            .unwrap_or(false);
+
+        // Legacy fallback: pre-#1541 WASM wrote the flag to instance storage.
+        let instance_val = env
+            .storage()
             .instance()
-            .get(&DataKey::InvestorRefunded(investor))
-            .unwrap_or(false)
+            .get(&keys::investor_refunded(investor.clone()))
+            .unwrap_or(false);
+
+        // When a legacy instance entry is found on a refund-path read, migrate it:
+        // write the persistent entry (if not already present) and remove the instance
+        // entry, so subsequent reads hit persistent storage directly and the instance
+        // map stops growing with every refund.
+        //
+        // The instance entry is removed even when the persistent entry already exists
+        // (e.g. a real refund followed by a stale instance seed): there is no reason to
+        // keep a redundant instance copy around. Migration is atomic within a single
+        // host call: Soroban commits all storage writes together or rolls them all back
+        // on trap, so there is no window in which both locations are simultaneously absent.
+        if instance_val {
+            if !persistent_val {
+                env.storage()
+                    .persistent()
+                    .set(&keys::investor_refunded(investor.clone()), &true);
+                let ttl = Self::get_storage_limit(env.clone());
+                env.storage().persistent().extend_ttl(
+                    &keys::investor_refunded(investor.clone()),
+                    ttl,
+                    ttl,
+                );
+            }
+            env.storage()
+                .instance()
+                .remove(&keys::investor_refunded(investor.clone()));
+        }
+
+        persistent_val || instance_val
+    }
+
+    /// Whether an investor has already received a refund in a cancelled escrow.
+    ///
+    /// Reads the refund flag via [`Self::investor_refunded`], which checks persistent
+    /// storage first and transparently migrates any legacy instance entry (issue #1541).
+    pub fn is_investor_refunded(env: Env, investor: Address) -> bool {
+        Self::investor_refunded(&env, investor)
     }
 
     /// Total principal already returned to investors via [`LiquifactEscrow::refund`].

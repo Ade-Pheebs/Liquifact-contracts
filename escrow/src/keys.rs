@@ -124,3 +124,9 @@ pub(crate) fn partial_close_min_bps() -> DataKey {
 pub(crate) fn investor_indexed(investor: Address) -> DataKey {
     DataKey::InvestorIndexed(investor)
 }
+
+/// Per-investor **persistent** refund marker, written once when a cancelled-escrow
+/// refund succeeds.  Absent ⇒ `false`.  Independent TTL from the contract instance.
+pub(crate) fn investor_refunded(investor: Address) -> DataKey {
+    DataKey::InvestorRefunded(investor)
+}
