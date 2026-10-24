@@ -855,6 +855,13 @@ pub enum EscrowError {
     MaturityHorizonUnchanged = 261,
     /// The requested horizon would exclude the configured maturity.
     MaturityHorizonBelowMaturity = 262,
+    /// [`LiquifactEscrow::partial_settle`] called while `funded_amount == 0`.
+    PartialSettleNothingFunded = 263,
+    /// [`LiquifactEscrow::partial_settle`] called while the funded share of target is below
+    /// the configured [`DataKey::PartialCloseMinBps`] threshold.
+    PartialSettleBelowThreshold = 264,
+    /// [`LiquifactEscrow::set_partial_close_min_bps`] rejected `bps > 10_000`.
+    PartialCloseMinBpsOutOfRange = 265,
 }
 
 #[inline(always)]
@@ -1296,6 +1303,9 @@ pub enum DataKey {
     /// Persistent marker set to `true` while `investor` has a positive contribution and is present
     /// in `DataKey::InvestorIndex`. Cleared when the investor fully unfunds.
     InvestorIndexed(Address),
+    /// Minimum funded share of target (basis points) required before
+    /// [`LiquifactEscrow::partial_settle`] may close funding early. Absent ⇒ `0`.
+    PartialCloseMinBps,
 }
 
 // --- Data types ---
@@ -2413,7 +2423,19 @@ pub struct CallbackExecutedEvent {
     pub phase: u32,
 }
 
+/// Emitted when the partial settlement minimum basis points threshold is updated.
+#[contractevent]
+pub struct PartialCloseMinBpsUpdated {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub invoice_id: Symbol,
+    pub old_bps: u32,
+    pub new_bps: u32,
+}
+
 // ---------------------------------------------------------------------------
+
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -6322,16 +6344,18 @@ impl LiquifactEscrow {
     /// Closes funding early for an under-funded invoice, transitioning the escrow to a settleable state.
     ///
     /// # Authorization
-    /// The configured **SME** address must authorize this call.
-    ///
-    /// Blocked while [`DataKey::LegalHold`] is active.
-    /// Closes funding early for an under-funded invoice, transitioning the escrow to a settleable state.
-    ///
-    /// # Authorization
     /// The configured **SME** or **Admin** address must authorize this call.
     ///
-    /// Blocked while [`DataKey::LegalHold`] is active.
+    /// Blocked while [`DataKey::LegalHold`] is active or operational pause is active.
     pub fn partial_settle(env: Env, caller: Address) -> InvoiceEscrow {
+        // Operational pause gate (read-only), before require_auth and orthogonal to legal hold.
+        ensure(
+            &env,
+            !Self::paused_blocks(&env, PauseEntry::Funding),
+            EscrowError::PausedBlocksFunding,
+        );
+        guard_not_paused(&env, EscrowError::PausedBlocksFunding, PauseEntry::Funding);
+
         caller.require_auth();
 
         guard_not_legal_hold(&env, EscrowError::LegalHoldBlocksPartialSettle);
@@ -6345,6 +6369,34 @@ impl LiquifactEscrow {
         );
 
         guard_status_eq(&env, escrow.status, 0, EscrowError::PartialSettleNotOpen);
+
+        ensure(
+            &env,
+            escrow.funded_amount > 0,
+            EscrowError::PartialSettleNothingFunded,
+        );
+
+        let min_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&keys::partial_close_min_bps())
+            .unwrap_or(0);
+
+        if min_bps > 0 {
+            let funded_scaled = escrow
+                .funded_amount
+                .checked_mul(10_000i128)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+            let target_threshold = escrow
+                .funding_target
+                .checked_mul(min_bps as i128)
+                .unwrap_or_else(|| fail(&env, EscrowError::ComputePayoutArithmeticOverflow));
+            ensure(
+                &env,
+                funded_scaled >= target_threshold,
+                EscrowError::PartialSettleBelowThreshold,
+            );
+        }
 
         // Transition to funded status early.
         escrow.status = 1;
@@ -6376,6 +6428,51 @@ impl LiquifactEscrow {
         .publish(&env);
 
         escrow
+    }
+
+    /// Admin-only setter for the minimum funded basis points threshold before `partial_settle`
+    /// may close funding early.
+    ///
+    /// Valid values are `0..=10_000`. Out-of-range values fail with
+    /// [`EscrowError::PartialCloseMinBpsOutOfRange`].
+    pub fn set_partial_close_min_bps(env: Env, bps: u32) -> u32 {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        guard_status_eq(&env, escrow.status, 0, EscrowError::PartialSettleNotOpen);
+
+        ensure(
+            &env,
+            bps <= 10_000,
+            EscrowError::PartialCloseMinBpsOutOfRange,
+        );
+
+        let old_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&keys::partial_close_min_bps())
+            .unwrap_or(0);
+
+        env.storage()
+            .instance()
+            .set(&keys::partial_close_min_bps(), &bps);
+
+        PartialCloseMinBpsUpdated {
+            name: symbol_short!("part_bps"),
+            invoice_id: escrow.invoice_id,
+            old_bps,
+            new_bps: bps,
+        }
+        .publish(&env);
+
+        bps
+    }
+
+    /// Get the minimum funded basis points threshold before `partial_settle` may close funding early.
+    pub fn get_partial_close_min_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&keys::partial_close_min_bps())
+            .unwrap_or(0)
     }
 
     /// Finalizes a funded escrow into **settled** status (status `1 → 2`), recording the
