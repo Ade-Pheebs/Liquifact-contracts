@@ -945,6 +945,8 @@ pub enum EscrowError {
     AllowlistExpiryInPast = 281,
     /// An investor attempted an action but their allowlist entry had expired.
     InvestorAllowlistExpired = 282,
+    /// Checked arithmetic overflow while updating yield-weighted principal.
+    YieldWeightOverflow = 283,
 }
 
 #[inline(always)]
@@ -1419,6 +1421,9 @@ pub enum DataKey {
     Pauser,
     /// Per-investor allowlist expiry timestamp (persistent storage). Absent ⇒ no expiry set.
     InvestorAllowlistExpiry(Address),
+    /// Sum of each investor contribution multiplied by their effective yield in basis points.
+    /// Instance storage; absent on legacy instances, which use the base-yield pool fallback.
+    YieldWeightedPrincipal,
 }
 
 // --- Data types ---
@@ -6980,6 +6985,19 @@ impl LiquifactEscrow {
         let investor_effective_yield_bps = resolution.effective_yield_bps;
         let tier_lock_secs = resolution.matched_lock_secs;
 
+        let weighted_before = env.storage().instance()
+            .get::<DataKey, i128>(&DataKey::YieldWeightedPrincipal)
+            .unwrap_or_else(|| {
+                // Seed a missing legacy aggregate from the historical base-yield estimate.
+                escrow.funded_amount.checked_mul(escrow.yield_bps as i128)
+                    .unwrap_or_else(|| fail(&env, EscrowError::YieldWeightOverflow))
+            });
+        let contribution_weight = amount.checked_mul(investor_effective_yield_bps as i128)
+            .unwrap_or_else(|| fail(&env, EscrowError::YieldWeightOverflow));
+        let weighted_after = weighted_before.checked_add(contribution_weight)
+            .unwrap_or_else(|| fail(&env, EscrowError::YieldWeightOverflow));
+        env.storage().instance().set(&DataKey::YieldWeightedPrincipal, &weighted_after);
+
         // Enforce the safe funding envelope: cumulative principal must never exceed
         // MAX_INVOICE_AMOUNT so compute_investor_payout stays inside its proven
         // overflow-free envelope for every yield_bps ∈ [0, 10_000]. This tighter bound
@@ -7459,19 +7477,15 @@ impl LiquifactEscrow {
         new_outstanding
     }
 
-    /// Computes `(coupon, settle_pool)` for `settle`, using the legacy base-yield formula
-    /// `coupon = funded_amount * yield_bps / 10_000` (floor).
+    /// Computes `(coupon, settle_pool)` for `settle` from the tier-aware aggregate pool
+    /// (see `aggregate_settle_pool`).
     fn settle_amounts(env: &Env, escrow: &InvoiceEscrow) -> (i128, i128) {
-        let coupon = escrow
-            .funded_amount
-            .checked_mul(escrow.yield_bps as i128)
-            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(10_000)
-            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow));
-
-        let settle_pool = escrow
-            .funded_amount
-            .checked_add(coupon)
+        // Tier-aware pool (issue #1529): `coupon = Σ contribution_i × effective_yield_i / 10_000`
+        // when the yield-weighted aggregate is recorded; legacy instances fall back to
+        // `funded_amount × yield_bps / 10_000`.
+        let settle_pool = Self::aggregate_settle_pool(env, escrow.funded_amount);
+        let coupon = settle_pool
+            .checked_sub(escrow.funded_amount)
             .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow));
 
         (coupon, settle_pool)
@@ -7880,7 +7894,7 @@ impl LiquifactEscrow {
     /// Shared base-yield settlement-pool computation used by
     /// [`LiquifactEscrow::get_settlement_pool`] and [`LiquifactEscrow::repay`].
     /// Returns `0` before funding.
-    fn base_settle_pool(env: &Env, escrow: &InvoiceEscrow) -> i128 {
+    fn base_settle_pool(env: &Env, _escrow: &InvoiceEscrow) -> i128 {
         let Some(snap) = env
             .storage()
             .instance()
@@ -7894,15 +7908,9 @@ impl LiquifactEscrow {
             return 0;
         }
 
-        let coupon = total_principal
-            .checked_mul(escrow.yield_bps as i128)
-            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
-            .checked_div(10_000)
-            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow));
-
-        total_principal
-            .checked_add(coupon)
-            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
+        // Tier-aware pool (issue #1529): uses yield-weighted principal when recorded,
+        // otherwise the legacy base-yield formula.
+        Self::aggregate_settle_pool(env, total_principal)
     }
 
     /// Authoritative on-chain aggregate view of the total settlement pool owed by the SME.
@@ -7946,6 +7954,25 @@ impl LiquifactEscrow {
     /// # Authorization
     ///
     /// None — pure read; no auth required and no state mutation.
+    /// Computes the pool from yield-weighted principal when available. Legacy instances
+    /// without the additive key retain the historical base-yield calculation.
+    fn aggregate_settle_pool(env: &Env, total_principal: i128) -> i128 {
+        let escrow: InvoiceEscrow = env.storage().instance().get(&DataKey::Escrow)
+            .unwrap_or_else(|| fail(env, EscrowError::EscrowNotInitialized));
+        let coupon = if let Some(weighted) = env.storage().instance()
+            .get::<DataKey, i128>(&DataKey::YieldWeightedPrincipal) {
+            weighted.checked_div(10_000)
+                .unwrap_or_else(|| fail(env, EscrowError::YieldWeightOverflow))
+        } else {
+            total_principal.checked_mul(escrow.yield_bps as i128)
+                .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
+                .checked_div(10_000)
+                .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
+        };
+        total_principal.checked_add(coupon)
+            .unwrap_or_else(|| fail(env, EscrowError::ComputePayoutArithmeticOverflow))
+    }
+
     pub fn get_settlement_pool(env: Env) -> i128 {
         // Preserve legacy behaviour: return 0 before funding without requiring the
         // escrow snapshot to be readable.
@@ -8904,6 +8931,8 @@ impl LiquifactEscrow {
     }
 
     /// Transfer principal only to its investor; batch mode skips ineligible entries.
+    // Deliberately does not update YieldWeightedPrincipal: refunds are only available in
+    // terminal status 4 (cancelled), which cannot transition to settlement.
     fn refund_core(env: &Env, investor: Address, skip_ineligible: bool) -> i128 {
         // Skip already-refunded entries without failing.  The read goes through
         // `investor_refunded`, which checks persistent storage first and migrates
@@ -9080,7 +9109,20 @@ impl LiquifactEscrow {
             fail(&env, EscrowError::OverWithdrawal);
         }
 
-        // 5. funded_amount decrement.
+        // 5. Decrement principal and the corresponding stored effective-yield weight.
+        let effective_yield = Self::get_persistent_investor_effective_yield(&env, investor.clone())
+            .unwrap_or(escrow.yield_bps);
+        let weight_to_remove = amount.checked_mul(effective_yield as i128)
+            .unwrap_or_else(|| fail(&env, EscrowError::YieldWeightOverflow));
+        // A legacy instance has no enumerable investor set, so its aggregate cannot be
+        // reconstructed safely. Keep the key absent and preserve the legacy base-yield view.
+        if let Some(weighted) = env.storage().instance()
+            .get::<DataKey, i128>(&DataKey::YieldWeightedPrincipal) {
+            let new_weighted = weighted.checked_sub(weight_to_remove)
+                .unwrap_or_else(|| fail(&env, EscrowError::YieldWeightOverflow));
+            ensure(&env, new_weighted >= 0, EscrowError::YieldWeightOverflow);
+            env.storage().instance().set(&DataKey::YieldWeightedPrincipal, &new_weighted);
+        }
         let new_funded_amount = escrow
             .funded_amount
             .checked_sub(amount)

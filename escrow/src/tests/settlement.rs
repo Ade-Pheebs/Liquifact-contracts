@@ -3009,6 +3009,43 @@ fn settlement_result_coupon_plus_funded_equals_pool() {
     );
 }
 
+/// Tier-aware aggregate pool must cover the sum of per-investor payouts (issue #1529).
+#[test]
+fn settlement_pool_uses_effective_yields_for_each_investor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = deploy(&env);
+    let admin = Address::generate(&env);
+    let sme = Address::generate(&env);
+    let tok = install_stellar_asset_token(&env);
+    let token = tok.id.clone();
+    let treasury = Address::generate(&env);
+    let investor_a = Address::generate(&env);
+    let investor_b = Address::generate(&env);
+    tok.stellar.mint(&investor_a, &500i128);
+    tok.stellar.mint(&investor_b, &500i128);
+    // The SME funds the 100-unit coupon shortfall at settle.
+    tok.stellar.mint(&sme, &100i128);
+    let mut tiers = SorobanVec::new(&env);
+    tiers.push_back(YieldTier { min_lock_secs: 1, yield_bps: 1_200 });
+
+    client.init(
+        &admin, &String::from_str(&env, "YPOOL1529"), &sme, &1_000i128,
+        &800i64, &0u64, &token, &None, &treasury, &Some(tiers),
+        &None, &None, &None, &None, &None, &None, &None, &None::<i64>,
+    );
+    client.fund(&investor_a, &500i128);
+    client.fund_with_commitment(&investor_b, &500i128, &1u64);
+
+    assert_eq!(client.get_settlement_pool(), 1_100);
+    assert_eq!(client.compute_investor_payout(&investor_a), 540);
+    assert_eq!(client.compute_investor_payout(&investor_b), 560);
+
+    let result = client.settle();
+    assert_eq!(result.settle_pool, 1_100);
+    assert_eq!(result.coupon, result.settle_pool - result.escrow.funded_amount);
+}
+
 /// `SettlementResult.settle_pool` must match `get_settlement_pool()`.
 #[test]
 fn settlement_result_pool_matches_get_settlement_pool() {
