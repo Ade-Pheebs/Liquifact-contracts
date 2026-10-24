@@ -947,6 +947,17 @@ pub enum EscrowError {
     InvestorAllowlistExpired = 282,
     /// Checked arithmetic overflow while updating yield-weighted principal.
     YieldWeightOverflow = 283,
+    /// [`LiquifactEscrow::settle_batch`] contains two or more entries with the same escrow address.
+    ///
+    /// Every escrow address in the batch must be unique. Duplicate addresses indicate a
+    /// malformed batch and the entire call is rejected atomically before any state mutation.
+    SettlementBatchDuplicate = 284,
+
+    /// [`LiquifactEscrow::settle_batch`] contains the batch contract's own address.
+    ///
+    /// Self-reference would cause the batch caller to attempt to settle itself, which is
+    /// always invalid. The entire call is rejected atomically before any state mutation.
+    SettlementBatchSelfReference = 285,
 }
 
 #[inline(always)]
@@ -2000,6 +2011,20 @@ pub struct SettlementFunded {
     pub amount: i128,
     /// Full settlement pool that the escrow must hold before claims open.
     pub settle_pool: i128,
+}
+
+/// Emitted by [`LiquifactEscrow::settle_batch`] after processing all entries.
+///
+/// # Fields
+/// - `name`: hardcoded `stl_batch` symbol.
+/// - `ok_count`: number of escrows successfully settled in this batch.
+/// - `fail_count`: number of escrows that were not settled (ineligible, already settled, etc.).
+#[contractevent]
+pub struct SettleBatchProcessed {
+    #[topic]
+    pub name: Symbol,
+    pub ok_count: u32,
+    pub fail_count: u32,
 }
 
 #[contractevent]
@@ -7338,27 +7363,43 @@ impl LiquifactEscrow {
         }
     }
 
-    /// Batch settle entrypoint: settle multiple escrows in a single call.
+    /// Batch settle entrypoint: settle multiple escrows in a single call, reporting per-entry results.
     ///
-    /// Each address is processed sequentially. All existing [`LiquifactEscrow::settle`]
-    /// invariants (pause gate, legal hold, SME auth, funded status, maturity check, and the
-    /// once-only [`EscrowError::EscrowAlreadySettled`] guard) are enforced per entry. The
-    /// entire batch is atomic: if any escrow fails to settle, the entire call reverts.
+    /// Each address is processed sequentially using `try_settle()` so that a single ineligible
+    /// escrow does not revert the entire batch. Eligible escrows are settled and their SME
+    /// settlement events are emitted; ineligible entries are recorded as failures.
+    ///
+    /// Up-front guards (checked atomically before any `try_settle` call):
+    /// - Empty / oversized batch.
+    /// - Any duplicate address in the list ([`EscrowError::SettlementBatchDuplicate`]).
+    /// - The batch contract's own address appearing in the list
+    ///   ([`EscrowError::SettlementBatchSelfReference`]).
     ///
     /// # Parameters
     /// - `escrows`: `Vec<Address>` of escrow contract addresses to settle.
     ///
-    /// # Errors
-    /// - [`EscrowError::SettlementBatchEmpty`] if `escrows` is empty
-    /// - [`EscrowError::SettlementBatchTooLarge`] if `escrows.len() > [`MAX_SETTLE_BATCH`]
+    /// # Returns
+    /// `Vec<u32>` with one entry per input address, in order:
+    /// - `0` — settled successfully.
+    /// - Any other value — the [`EscrowError`] contract code returned by the target's `settle`
+    ///   call (e.g. `MaturityNotReached = 101`, `EscrowAlreadySettled = 236`).
+    ///   `u32::MAX` is used as a sentinel for non-contract (host) errors that do not carry
+    ///   a typed code.
     ///
-    /// Per-entry errors (not funded, maturity not reached, legal hold, paused, auth failure)
-    /// terminate the entire batch atomically.
+    /// # Errors (batch-level, reverts the whole call)
+    /// - [`EscrowError::SettlementBatchEmpty`] if `escrows` is empty.
+    /// - [`EscrowError::SettlementBatchTooLarge`] if `escrows.len() > MAX_SETTLE_BATCH`.
+    /// - [`EscrowError::SettlementBatchDuplicate`] if any two entries share the same address.
+    /// - [`EscrowError::SettlementBatchSelfReference`] if the batch contract's own address appears.
+    ///
+    /// # Auth
+    /// Each target escrow's `settle` entrypoint requires the SME's `require_auth`. The caller
+    /// must ensure each SME has authorised the settlement before this call is made.
     ///
     /// # Events
-    /// One [`EscrowSettled`] per successfully settled escrow (emitted by each target escrow's
-    /// [`LiquifactEscrow::settle`] call).
-    pub fn settle_batch(env: Env, escrows: Vec<Address>) {
+    /// - One [`EscrowSettled`] per successfully settled escrow (emitted by each target's `settle`).
+    /// - One [`SettleBatchProcessed`] emitted by this contract after all entries are processed.
+    pub fn settle_batch(env: Env, escrows: Vec<Address>) -> Vec<u32> {
         let n = escrows.len();
         ensure(&env, n > 0, EscrowError::SettlementBatchEmpty);
         ensure(
@@ -7367,11 +7408,58 @@ impl LiquifactEscrow {
             EscrowError::SettlementBatchTooLarge,
         );
 
+        // Up-front self-reference and duplicate checks — O(n²), bounded by MAX_SETTLE_BATCH = 50.
+        let this = env.current_contract_address();
+        for i in 0..n {
+            let addr_i = escrows.get(i).unwrap();
+            ensure(
+                &env,
+                addr_i != this,
+                EscrowError::SettlementBatchSelfReference,
+            );
+            for j in (i + 1)..n {
+                let addr_j = escrows.get(j).unwrap();
+                ensure(
+                    &env,
+                    addr_i != addr_j,
+                    EscrowError::SettlementBatchDuplicate,
+                );
+            }
+        }
+
+        let mut results: Vec<u32> = Vec::new(&env);
+        let mut ok_count: u32 = 0;
+        let mut fail_count: u32 = 0;
+
         for i in 0..n {
             let escrow_addr = escrows.get(i).unwrap();
             let client = LiquifactEscrowClient::new(&env, &escrow_addr);
-            client.settle();
+            match client.try_settle() {
+                Ok(_) => {
+                    results.push_back(0u32);
+                    ok_count = ok_count.saturating_add(1);
+                }
+                Err(Ok(err)) => {
+                    // Typed contract error — surface the numeric code.
+                    results.push_back(err.get_code());
+                    fail_count = fail_count.saturating_add(1);
+                }
+                Err(Err(_)) => {
+                    // Host / non-contract error; use sentinel.
+                    results.push_back(u32::MAX);
+                    fail_count = fail_count.saturating_add(1);
+                }
+            }
         }
+
+        SettleBatchProcessed {
+            name: symbol_short!("stl_batch"),
+            ok_count,
+            fail_count,
+        }
+        .publish(&env);
+
+        results
     }
 
     /// Repay a withdrawn escrow (`status == 3`) on-chain, in one or more instalments.
