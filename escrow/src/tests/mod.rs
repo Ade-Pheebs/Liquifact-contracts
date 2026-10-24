@@ -90,6 +90,7 @@ mod refund_batch;
 mod repayment;
 mod settlement;
 mod settlement_config_view;
+mod settlement_funding;
 mod timelocked_upgrade;
 mod unfund_investor_index;
 mod withdraw_attestation_gate;
