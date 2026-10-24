@@ -87,6 +87,7 @@ mod persistent_refund_flags;
 mod properties;
 mod reconciliation_lifecycle;
 mod refund_batch;
+mod repayment;
 mod settlement;
 mod settlement_config_view;
 mod timelocked_upgrade;
