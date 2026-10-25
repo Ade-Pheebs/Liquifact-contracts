@@ -83,6 +83,7 @@ mod legal_hold;
 mod maturity_horizon;
 mod migration_errors;
 mod paginated_views;
+mod investor_position;
 mod pause;
 mod pause_bypass;
 mod pauser_boundary_tests;
