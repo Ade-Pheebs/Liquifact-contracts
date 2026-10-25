@@ -19,16 +19,16 @@ use soroban_sdk::{
 
 /// Deploy and init an escrow backed by a real SAC, returning
 /// `(client, escrow_id, token_id, sac_admin, admin, sme)`.
-fn deploy_real(
-    env: &Env,
+fn deploy_real<'a>(
+    env: &'a Env,
     target: i128,
     yield_bps: i64,
     invoice_id: &str,
 ) -> (
-    crate::LiquifactEscrowClient<'_>,
+    crate::LiquifactEscrowClient<'a>,
     Address,
     Address,
-    StellarAssetClient<'_>,
+    StellarAssetClient<'a>,
     Address,
     Address,
 ) {
@@ -172,7 +172,7 @@ fn position_refunded_investor() {
     client.fund(&investor, &contribution);
 
     // Cancel (status 0 → 4)
-    client.cancel_funding(&admin);
+    client.cancel_funding();
 
     // Refund
     client.refund(&investor);
