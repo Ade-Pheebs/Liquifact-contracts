@@ -32,6 +32,25 @@ fn deploy_real<'a>(
     Address,
     Address,
 ) {
+    deploy_real_tiers(env, target, yield_bps, invoice_id, None)
+}
+
+/// Same as [`deploy_real`] but with an optional yield-tier table passed to `init`
+/// (tiers are immutable after `init`).
+fn deploy_real_tiers<'a>(
+    env: &'a Env,
+    target: i128,
+    yield_bps: i64,
+    invoice_id: &str,
+    tiers: Option<soroban_sdk::Vec<crate::YieldTier>>,
+) -> (
+    crate::LiquifactEscrowClient<'a>,
+    Address,
+    Address,
+    StellarAssetClient<'a>,
+    Address,
+    Address,
+) {
     env.mock_all_auths();
 
     let sac = env.register_stellar_asset_contract_v2(Address::generate(env));
@@ -55,7 +74,7 @@ fn deploy_real<'a>(
         &token_id,
         &None,
         &treasury,
-        &None,
+        &tiers,
         &None,
         &None,
         &None,
@@ -102,19 +121,22 @@ fn position_tiered_investor_effective_yield() {
     let target = 200_000i128;
     let base_yield: i64 = 400; // escrow-level bps
 
-    let (client, _escrow_id, _token_id, sac_admin, admin, _sme) =
-        deploy_real(&env, target, base_yield, "POS_TIERED");
-
-    // Configure a yield tier: lock >= 3600 s → 800 bps
+    // Configure a yield tier at init: lock >= 3600 s → 800 bps
     let tier_yield: i64 = 800;
     let lock_secs: u64 = 3_600;
-    client.set_yield_tiers(&soroban_sdk::vec![
+    let (client, _escrow_id, _token_id, sac_admin, _admin, _sme) = deploy_real_tiers(
         &env,
-        crate::YieldTier {
-            min_lock_secs: lock_secs,
-            yield_bps: tier_yield,
-        }
-    ]);
+        target,
+        base_yield,
+        "POS_TIERED",
+        Some(soroban_sdk::vec![
+            &env,
+            crate::YieldTier {
+                min_lock_secs: lock_secs,
+                yield_bps: tier_yield,
+            }
+        ]),
+    );
 
     let investor = Address::generate(&env);
     sac_admin.mint(&investor, &target);
@@ -303,12 +325,16 @@ fn funding_records_near_u32_max_does_not_trap() {
 #[test]
 fn yield_tiers_page_near_u32_max_does_not_trap() {
     let env = Env::default();
-    let (client, ..) = deploy_real(&env, 100_000i128, 500i64, "POS_YTOVF");
-
-    client.set_yield_tiers(&soroban_sdk::vec![
+    let (client, ..) = deploy_real_tiers(
         &env,
-        crate::YieldTier { min_lock_secs: 3600, yield_bps: 800 }
-    ]);
+        100_000i128,
+        500i64,
+        "POS_YTOVF",
+        Some(soroban_sdk::vec![
+            &env,
+            crate::YieldTier { min_lock_secs: 3600, yield_bps: 800 }
+        ]),
+    );
 
     let result = client.get_yield_tiers_page(&(u32::MAX - 1), &50);
     assert_eq!(result.len(), 0);
