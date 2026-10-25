@@ -13,7 +13,7 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger as _},
     token::StellarAssetClient,
-    Address, BytesN, Env,
+    Address, BytesN, Env, Event,
 };
 
 // ── shared setup ──────────────────────────────────────────────────────────────
@@ -152,8 +152,11 @@ fn events_order_escrow_funded_then_contribution_referenced() {
         "expected at least 2 events (EscrowFunded + ContributionReferenced)"
     );
 
+    // The final two events are EscrowFunded then ContributionReferenced (any token
+    // transfer events emitted by the SAC come earlier).
+    let n = events_list.len();
     // First event: EscrowFunded
-    let first = events_list.first().unwrap();
+    let first = &events_list[n - 2];
     assert_eq!(
         *first,
         EscrowFunded {
@@ -170,7 +173,7 @@ fn events_order_escrow_funded_then_contribution_referenced() {
     );
 
     // Second event: ContributionReferenced
-    let second = events_list.get(1).unwrap();
+    let second = &events_list[n - 1];
     assert_eq!(
         *second,
         ContributionReferenced {
@@ -200,7 +203,7 @@ fn gate_paused_blocks_fund_with_reference() {
     client.set_paused(&true, &crate::PauseScope::Funding, &crate::PauseReason::Incident);
 
     let result = client.try_fund_with_reference(&investor, &amount, &make_ref(&env, 0x10));
-    super::assert_contract_error(result, EscrowError::ContractPaused);
+    super::assert_contract_error(result, EscrowError::PausedBlocksFunding);
 }
 
 /// Gate 2: LegalHoldActive blocks fund_with_reference.
@@ -217,7 +220,7 @@ fn gate_legal_hold_blocks_fund_with_reference() {
     client.set_legal_hold(&true);
 
     let result = client.try_fund_with_reference(&investor, &amount, &make_ref(&env, 0x20));
-    super::assert_contract_error(result, EscrowError::LegalHoldActive);
+    super::assert_contract_error(result, EscrowError::LegalHoldBlocksFunding);
 }
 
 /// Gate 3: Allowlist blocks non-allowlisted investor.
@@ -263,7 +266,7 @@ fn gate_funding_closed_after_target_reached() {
     let investor2 = Address::generate(&env);
     sac_admin.mint(&investor2, &1_000i128);
     let result = client.try_fund_with_reference(&investor2, &1_000i128, &make_ref(&env, 0x50));
-    super::assert_contract_error(result, EscrowError::FundingClosed);
+    super::assert_contract_error(result, EscrowError::EscrowNotOpenForFunding);
 }
 
 // ── AC4: get_reference_owner ──────────────────────────────────────────────────
