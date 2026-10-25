@@ -102,7 +102,7 @@ fn healthy_open_cancelled_refund_all_zero() {
     let env = Env::default();
     let target = 80_000i128;
     let contribution = 20_000i128;
-    let (client, _escrow_id, _token_id, sac_admin, admin, ..) =
+    let (client, _escrow_id, _token_id, sac_admin, _admin, ..) =
         deploy_real(&env, target, 500i64, "INV_LIFE2");
 
     assert_eq!(client.check_core_invariants(), 0, "open before any funding");
@@ -112,7 +112,7 @@ fn healthy_open_cancelled_refund_all_zero() {
     client.fund(&investor, &contribution);
     assert_eq!(client.check_core_invariants(), 0, "open with partial funding");
 
-    client.cancel_funding(&admin);
+    client.cancel_funding();
     assert_eq!(client.check_core_invariants(), 0, "status 4 after cancel");
 
     client.refund(&investor);
@@ -354,7 +354,7 @@ fn audit_investor_page_120_investors_sum_equals_funded_amount() {
     let per_investor: i128 = 1_000;
     let n: u32 = 120;
     let total_target: i128 = per_investor * (n as i128 + 10); // headroom
-    let (client, .., sac_admin, ..) =
+    let (client, _, _, sac_admin, ..) =
         deploy_real(&env, total_target, 500i64, "INV_BATCH");
 
     for _ in 0..n {
@@ -402,7 +402,7 @@ fn audit_page_loop_until_empty() {
     let per_investor: i128 = 500;
     let n: u32 = 120;
     let total_target = per_investor * (n as i128 + 5);
-    let (client, .., sac_admin, ..) =
+    let (client, _, _, sac_admin, ..) =
         deploy_real(&env, total_target, 500i64, "INV_LOOP");
 
     for _ in 0..n {
@@ -441,7 +441,7 @@ fn audit_page_empty_index_returns_zeros() {
 fn audit_page_start_past_end_returns_zeros() {
     let env = Env::default();
     let target = 1_000i128;
-    let (client, .., sac_admin, ..) = deploy_real(&env, target, 500i64, "INV_POOB");
+    let (client, _, _, sac_admin, ..) = deploy_real(&env, target, 500i64, "INV_POOB");
     let inv = Address::generate(&env);
     sac_admin.mint(&inv, &target);
     client.fund(&inv, &target);
@@ -454,7 +454,7 @@ fn audit_page_start_past_end_returns_zeros() {
 fn audit_page_zero_limit_returns_zeros() {
     let env = Env::default();
     let target = 1_000i128;
-    let (client, .., sac_admin, ..) = deploy_real(&env, target, 500i64, "INV_PZERO");
+    let (client, _, _, sac_admin, ..) = deploy_real(&env, target, 500i64, "INV_PZERO");
     let inv = Address::generate(&env);
     sac_admin.mint(&inv, &target);
     client.fund(&inv, &target);
@@ -469,7 +469,7 @@ fn audit_page_limit_above_cap_clamped() {
     let per_investor = 1_000i128;
     let n: u32 = 3;
     let total_target = per_investor * 10;
-    let (client, .., sac_admin, ..) = deploy_real(&env, total_target, 500i64, "INV_PCAP");
+    let (client, _, _, sac_admin, ..) = deploy_real(&env, total_target, 500i64, "INV_PCAP");
 
     for _ in 0..n {
         let inv = Address::generate(&env);
@@ -512,7 +512,7 @@ fn audit_investor_page_budget_50_entries() {
     let per_investor: i128 = 1_000;
     let n: u32 = 50;
     let total_target = per_investor * (n as i128 + 10);
-    let (client, .., sac_admin, ..) =
+    let (client, _, _, sac_admin, ..) =
         deploy_real(&env, total_target, 500i64, "INV_BUDG2");
 
     for _ in 0..n {
